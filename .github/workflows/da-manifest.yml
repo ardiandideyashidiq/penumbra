@@ -1,0 +1,96 @@
+name: Build DA manifest
+
+# Regenerates DA/manifest.json from the committed DA blobs + DA/registry.json.
+# Trigger is scoped to .bin files and the registry only — the manifest
+# commit-back writes DA/manifest.json, which must NOT re-trigger this workflow
+# (hence the narrow path filter; a `DA/**` filter would loop forever).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "DA/**.bin"
+      - "DA/registry.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: da-manifest
+  cancel-in-progress: false
+
+jobs:
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate manifest.json
+        id: generate
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse --short HEAD)"
+          python3 - "$SHA" <<'PY'
+          import hashlib, json, os, sys
+
+          sha = sys.argv[1]
+          root = "DA"
+          reg_path = os.path.join(root, "registry.json")
+
+          if not os.path.isfile(reg_path):
+              sys.exit("DA/registry.json is missing")
+
+          with open(reg_path, encoding="utf-8") as f:
+              registry = json.load(f)
+
+          # index by (brand, chipset)
+          by_key = {}
+          for entry in registry.get("dais", []):
+              by_key[(entry["brand"], entry["chipset"])] = entry
+
+          dais = []
+          for dirpath, _dirs, files in os.walk(root):
+              for name in sorted(files):
+                  if not name.endswith(".bin"):
+                      continue
+                  brand = os.path.relpath(dirpath, root)
+                  if brand == ".":
+                      sys.exit(f"DA blob {name!r} must live in a brand subdir like DA/<brand>/<chipset>.bin")
+                  chipset = os.path.splitext(name)[0]
+                  key = (brand, chipset)
+                  reg = by_key.get(key)
+                  if reg is None:
+                      sys.exit(f"DA blob {dirpath}/{name} has no entry in DA/registry.json")
+                  path = os.path.join(dirpath, name)
+                  with open(path, "rb") as f:
+                      digest = hashlib.sha256(f.read()).hexdigest()
+                  dais.append({
+                      "brand": brand,
+                      "chipset": chipset,
+                      "devices": reg.get("devices", []),
+                      "url": f"https://raw.githubusercontent.com/{os.environ['GITHUB_REPOSITORY']}/main/{path}",
+                      "sha256": digest,
+                  })
+
+          manifest = {"version": sha, "dais": dais}
+          out = os.path.join(root, "manifest.json")
+          with open(out, "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          print(f"manifest: {len(dais)} DA entries")
+          PY
+
+      - name: Commit if changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- DA/manifest.json; then
+            echo "manifest unchanged, skipping commit"
+          else
+            git add DA/manifest.json
+            git commit -m "chore(da): regenerate DA manifest"
+            git push
+          fi
